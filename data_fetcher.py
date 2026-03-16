@@ -60,6 +60,38 @@ TITLE3_PER_ELL_FALLBACK = 250.0
 # MTA Subway Stations — NY State Open Data (more reliable than NYC Open Data kk4q-3rt2)
 MTA_STATIONS_CSV = "https://data.ny.gov/api/views/39hk-dx4f/rows.csv"
 
+# MTA official line colors (used in Geography tab)
+MTA_LINE_COLORS = {
+    "1": "#EE352E", "2": "#EE352E", "3": "#EE352E",
+    "4": "#00933C", "5": "#00933C", "6": "#00933C", "6X": "#00933C",
+    "7": "#B933AD", "7X": "#B933AD",
+    "A": "#0039A6", "C": "#0039A6", "E": "#0039A6",
+    "B": "#FF6319", "D": "#FF6319", "F": "#FF6319", "FX": "#FF6319", "M": "#FF6319",
+    "G": "#6CBE45",
+    "J": "#996633", "Z": "#996633",
+    "L": "#A7A9AC",
+    "N": "#FCCC0A", "Q": "#FCCC0A", "R": "#FCCC0A", "W": "#FCCC0A",
+    "S": "#808183", "FS": "#808183", "GS": "#808183",
+    "SI": "#007BC0",
+}
+
+# Ordered list of all distinct subway lines for UI dropdowns
+SUBWAY_LINES_ORDERED = [
+    "1", "2", "3", "4", "5", "6",
+    "7", "A", "C", "E", "B", "D", "F", "M",
+    "G", "J", "Z", "L", "N", "Q", "R", "W", "S", "SI",
+]
+
+
+def _dbn_to_short(dbn: str) -> str:
+    """Strip district prefix from DBN: '01M015' → 'M015'."""
+    s = str(dbn).strip().upper()
+    for i, c in enumerate(s):
+        if c.isalpha():
+            return s[i:]
+    return s
+
+
 # NYC borough → county BEDS code prefix in the NYSED Title I table
 BOROUGH_BEDS = {
     "Manhattan":     ["3000"],            # New York County (BEDS 300000010000)

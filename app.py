@@ -12,6 +12,7 @@ from data_fetcher import (
     load_schools, refresh_all_data, generate_demo_data, save_schools,
     load_subway_stations, fetch_subway_stations, save_subway_stations,
     map_schools_to_stations, _haversine_km,
+    MTA_LINE_COLORS, SUBWAY_LINES_ORDERED, _dbn_to_short,
 )
 
 # ─── Page config ─────────────────────────────────────────────────────────────
@@ -175,18 +176,44 @@ _FOCUS_THEMES = {
 }
 
 
-def extract_focus_goals(text: str, n: int = 3) -> str:
-    """Return top N focus keywords from CEP summary text as 'a · b · c'."""
-    if not text:
-        return ""
-    tl = text.lower()
+def extract_focus_goals(text: str = "", school: dict = None, n: int = 3) -> str:
+    """Return top N focus keywords from CEP summary text, with quantitative fallback."""
     found = []
-    for theme, keywords in _FOCUS_THEMES.items():
-        if any(kw in tl for kw in keywords):
-            found.append(theme)
-        if len(found) >= n:
-            break
-    return " · ".join(found[:n])
+
+    # Primary: text-based from CEP summary
+    if text and text.strip():
+        tl = text.lower()
+        for theme, keywords in _FOCUS_THEMES.items():
+            if any(kw in tl for kw in keywords):
+                found.append(theme)
+            if len(found) >= n:
+                break
+
+    # Fallback: derive from quantitative signals when text is absent/short
+    if school and len(found) < n:
+        ela  = pd.to_numeric(school.get("ela_proficiency"), errors="coerce")
+        ell  = float(school.get("ell_pct") or 0)
+        att  = bool(school.get("has_attendance_goal"))
+        t3   = float(school.get("title3_amount") or 0)
+        enr  = float(school.get("total_enrollment") or 0)
+        signals = []
+        if pd.notna(ela) and float(ela) < 35 and "literacy" not in found:
+            signals.append("literacy")
+        if ell >= 30 and "ELL support" not in found:
+            signals.append("ELL support")
+        if att and "attendance" not in found:
+            signals.append("attendance")
+        if t3 > 0 and ell >= 20 and "ELL support" not in found + signals:
+            signals.append("ELL support")
+        if enr >= 1000 and len(found) + len(signals) < n and "high-enrollment" not in found:
+            signals.append("high-enrollment")
+        for sig in signals:
+            if len(found) >= n:
+                break
+            if sig not in found:
+                found.append(sig)
+
+    return " · ".join(found[:n]) if found else ""
 
 
 # ─── Helper: radar chart ──────────────────────────────────────────────────────
@@ -300,27 +327,31 @@ with tab_list:
 
     table_df = df.reset_index(drop=True).copy()
 
-    # Zero-pad DBN for URL construction
+    # DBN helpers for URL construction
     table_df["_dbn_padded"] = table_df["dbn"].apply(_pad_dbn)
+    table_df["_dbn_short"]  = table_df["dbn"].apply(_dbn_to_short)  # M015 not 01M015
 
-    # CEP link: only show if PDF was confirmed available (or not yet checked)
-    # "unavailable"/"data"/"error" = PDF was inaccessible; don't show a broken link
-    def _cep_url(row):
-        src = str(row.get("summary_source", ""))
-        if src in ("unavailable", "data", "error"):
-            return None
-        return ("https://www.nycenet.edu/documents/oaosi/cep/2024-25/CEP_"
-                + row["_dbn_padded"] + ".pdf")
-
-    table_df["cep_pdf_url"]  = table_df.apply(_cep_url, axis=1)
+    # CEP link: 2025-26 URL. Hide link only when PDF confirmed unavailable.
+    _src = (table_df.get("summary_source", pd.Series("", index=table_df.index))
+            .fillna("").astype(str))
+    _unavail = _src.isin(["unavailable", "data", "error"])
+    _cep_base = ("https://www.nycenet.edu/documents/oaosi/cep/2025-26/cep_"
+                 + table_df["_dbn_short"] + ".pdf")
+    # Use list to avoid pandas DataFrame-multi-column assignment bug
+    table_df["cep_pdf_url"] = [
+        None if u else url
+        for u, url in zip(_unavail.tolist(), _cep_base.tolist())
+    ]
     table_df["snapshot_url"] = ("https://tools.nycps.org/reports/quality-snapshot/"
                                 + table_df["_dbn_padded"])
 
-    # Focus goals from CEP summary
-    table_df["focus_goals"] = table_df.get("needs_summary",
-                                            pd.Series("", index=table_df.index)).apply(
-        lambda t: extract_focus_goals(str(t or ""))
-    )
+    # Focus goals: text-based from CEP summary + quantitative fallback
+    _summaries = (table_df.get("needs_summary", pd.Series("", index=table_df.index))
+                  .fillna("").astype(str))
+    table_df["focus_goals"] = [
+        extract_focus_goals(text, school=row.to_dict())
+        for text, (_, row) in zip(_summaries.tolist(), table_df.iterrows())
+    ]
 
     # Boolean goal columns
     for gc in ["has_literacy_goal", "has_ell_goal"]:
@@ -455,8 +486,9 @@ with tab_list:
         idx    = selected_rows[0]
         school = df.iloc[idx]
         tier   = str(school.get("tier", "Low"))
-        dbn     = str(school["dbn"])
-        dbn_pad = _pad_dbn(dbn)
+        dbn      = str(school["dbn"])
+        dbn_pad  = _pad_dbn(dbn)
+        dbn_sht  = _dbn_to_short(dbn)
 
         tier_badge = {
             "High":   '<span class="badge-high">High Priority</span>',
@@ -468,15 +500,15 @@ with tab_list:
         st.markdown(f"### {school['school_name']}  {tier_badge}", unsafe_allow_html=True)
 
         cep_src      = str(school.get("summary_source", ""))
-        cep_url      = f"https://www.nycenet.edu/documents/oaosi/cep/2024-25/CEP_{dbn_pad}.pdf"
+        cep_url      = f"https://www.nycenet.edu/documents/oaosi/cep/2025-26/cep_{dbn_sht}.pdf"
         snapshot_url = f"https://tools.nycps.org/reports/quality-snapshot/{dbn_pad}"
-        cep_link     = (f"[📄 CEP PDF]({cep_url}){{target=_blank}}"
-                        if cep_src != "unavailable"
-                        else "📄 CEP unavailable")
+        cep_link_txt = ("📄 CEP unavailable"
+                        if cep_src in ("unavailable", "data", "error")
+                        else f"[📄 CEP PDF]({cep_url})")
         st.caption(
             f"DBN {dbn_pad}  ·  {school.get('address', '—')}  ·  "
             f"{school['borough']}  ·  {school['grade_band']}  ·  "
-            f"[📄 CEP PDF]({cep_url})  ·  [📊 Quality Snapshot]({snapshot_url})"
+            f"{cep_link_txt}  ·  [📊 Quality Snapshot]({snapshot_url})"
         )
 
         # Metric row
@@ -747,16 +779,14 @@ with tab_chart:
 
 
 # ════════════════════════════════════════════════════════
-#  TAB 4 — GEOGRAPHY (Interactive station + school map)
+#  TAB 4 — GEOGRAPHY (Subway-focused interactive map)
 # ════════════════════════════════════════════════════════
 with tab_geo:
-    st.markdown("### 🗺 Geography — Schools & Subway Territory")
-    st.caption("All filtered schools plotted on the map. Select a subway station to see "
-               "nearby schools and their aggregate profile.")
 
     stations_df = load_subway_stations()
 
     if stations_df.empty:
+        st.markdown("### 🚇 Geography — Subway Territory View")
         st.info("Subway station data not yet loaded. "
                 "Click **Refresh Data** in the sidebar, or load stations only:")
         if st.button("🚇 Load Subway Station Data", type="primary", key="load_geo_stations"):
@@ -768,75 +798,120 @@ with tab_geo:
                     st.rerun()
                 else:
                     st.error("Could not fetch station data — check internet connection.")
-    else:
-        # ── Controls ────────────────────────────────────────────────────────
-        def _split_lines(raw):
-            return [p.strip() for p in str(raw).replace(",", " ").split() if p.strip()]
+        st.stop()
 
-        all_lines = sorted({line for raw in stations_df["line"].dropna()
-                            for line in _split_lines(raw)})
+    # ── Helpers for line parsing ──────────────────────────────────────────────
+    def _split_lines(raw: str) -> list[str]:
+        """Parse 'A C E' or 'A-C-E' or 'A,C,E' into ['A','C','E']."""
+        return [p.strip() for p in str(raw).replace(",", " ").replace("-", " ").split()
+                if p.strip()]
 
-        ctrl1, ctrl2 = st.columns([2, 3])
-        with ctrl1:
-            line_filter = st.multiselect(
-                "Filter subway lines (empty = all)",
-                all_lines, default=[],
-                help="Show only stations serving these lines",
-                key="geo_lines",
-            )
-        with ctrl2:
-            station_list = ["(none — show all schools)"]
-            if line_filter:
-                vis_st = stations_df[
-                    stations_df["line"].apply(
-                        lambda l: bool(set(_split_lines(l)) & set(line_filter))
-                    )
-                ]
-            else:
-                vis_st = stations_df
-            station_list += sorted(vis_st["station_name"].unique().tolist())
-            sel_station = st.selectbox(
-                "Focus station → nearby schools panel",
-                station_list, index=0,
-                key="geo_station",
-            )
+    def _primary_line(raw: str) -> str:
+        parts = _split_lines(raw)
+        return parts[0] if parts else ""
 
-        # ── Map data ────────────────────────────────────────────────────────
-        geo_schools = df.copy()
-        geo_schools["lat"] = pd.to_numeric(geo_schools["lat"], errors="coerce")
-        geo_schools["lon"] = pd.to_numeric(geo_schools["lon"], errors="coerce")
-        geo_schools = geo_schools.dropna(subset=["lat", "lon"])
-        geo_schools = geo_schools[
-            geo_schools["lat"].between(40.4, 41.0) &
-            geo_schools["lon"].between(-74.4, -73.6)
-        ]
+    def _station_color(raw: str) -> str:
+        return MTA_LINE_COLORS.get(_primary_line(raw), "#64748b")
 
-        # Determine map center
-        if sel_station != "(none — show all schools)":
-            st_row = vis_st[vis_st["station_name"] == sel_station]
-            map_center = ({"lat": float(st_row.iloc[0]["lat"]),
-                           "lon": float(st_row.iloc[0]["lon"])}
-                          if not st_row.empty
-                          else {"lat": 40.710, "lon": -73.960})
-            map_zoom = 13
+    # Enrich stations with primary line color
+    stations_plot = stations_df.copy()
+    stations_plot["primary_line"]   = stations_plot["line"].apply(_primary_line)
+    stations_plot["marker_color"]   = stations_plot["line"].apply(_station_color)
+    stations_plot["hover_text"]     = (stations_plot["station_name"]
+                                        + " · Lines: " + stations_plot["line"])
+
+    # ── Sidebar-style controls ────────────────────────────────────────────────
+    st.markdown("### 🚇 Geography — Subway Territory View")
+
+    # Which lines exist in the station data
+    data_lines = sorted({ln for raw in stations_df["line"].dropna()
+                         for ln in _split_lines(raw)})
+    # Keep ordered by MTA convention where possible
+    ordered_lines = [l for l in SUBWAY_LINES_ORDERED if l in data_lines] + \
+                    [l for l in data_lines if l not in SUBWAY_LINES_ORDERED]
+
+    ctrl1, ctrl2, ctrl3 = st.columns([2, 3, 2])
+    with ctrl1:
+        sel_line = st.selectbox(
+            "Subway line",
+            ["All lines"] + ordered_lines,
+            key="geo_line_sel",
+            help="Filter stations to a single line and color-code them",
+        )
+    with ctrl2:
+        # Build station list for the selected line
+        if sel_line == "All lines":
+            vis_stations = stations_plot
         else:
-            map_center = {"lat": 40.710, "lon": -73.960}
-            map_zoom = 10
+            vis_stations = stations_plot[
+                stations_plot["line"].apply(lambda l: sel_line in _split_lines(l))
+            ]
+        station_names = ["(click a station below to see nearby schools)"] + \
+                        sorted(vis_stations["station_name"].unique().tolist())
+        sel_station = st.selectbox(
+            "Focus station",
+            station_names,
+            key="geo_station_sel",
+        )
+    with ctrl3:
+        geo_radius_km = st.slider(
+            "Radius (km)", 0.3, 3.0, 1.0, 0.1,
+            key="geo_radius",
+            help="Schools within this radius of selected station appear in panel",
+        )
 
-        # Build map
+    # ── Prepare school map data ───────────────────────────────────────────────
+    geo_schools = df.copy()
+    geo_schools["lat"] = pd.to_numeric(geo_schools["lat"], errors="coerce")
+    geo_schools["lon"] = pd.to_numeric(geo_schools["lon"], errors="coerce")
+    geo_schools = geo_schools.dropna(subset=["lat", "lon"])
+    geo_schools = geo_schools[
+        geo_schools["lat"].between(40.4, 41.0) &
+        geo_schools["lon"].between(-74.4, -73.6)
+    ]
+    geo_schools["focus"] = [
+        extract_focus_goals(str(r.get("needs_summary") or ""), school=r.to_dict())
+        for _, r in geo_schools.iterrows()
+    ]
+    geo_schools["cep_short"] = geo_schools["dbn"].apply(_dbn_to_short)
+
+    # Selected station row
+    sel_st_row = (vis_stations[vis_stations["station_name"] == sel_station]
+                  if sel_station != station_names[0] else pd.DataFrame())
+
+    # Map center
+    if not sel_st_row.empty:
+        map_center = {"lat": float(sel_st_row.iloc[0]["lat"]),
+                      "lon": float(sel_st_row.iloc[0]["lon"])}
+        map_zoom = 14
+    else:
+        map_center = {"lat": 40.710, "lon": -73.960}
+        map_zoom = 11
+
+    # ── Build split layout: map | panel ──────────────────────────────────────
+    map_col, panel_col = st.columns([3, 2])
+
+    with map_col:
         if geo_schools.empty:
             st.info("No geo-coded schools in current filter.")
         else:
+            # Schools layer (tier-colored dots)
             fig_geo = px.scatter_mapbox(
                 geo_schools,
                 lat="lat", lon="lon",
-                color="tier", color_discrete_map=TIER_COLORS,
-                size="priority_score", size_max=16,
+                color="tier",
+                color_discrete_map=TIER_COLORS,
+                size="priority_score", size_max=14,
                 hover_name="school_name",
                 hover_data={
-                    "priority_score": ":.1f", "borough": True,
-                    "grade_band": True, "ell_pct": ":.1f",
-                    "tier": False, "lat": False, "lon": False,
+                    "priority_score": ":.1f",
+                    "ell_pct":        ":.1f",
+                    "grade_band":     True,
+                    "focus":          True,
+                    "tier":           False,
+                    "lat":            False,
+                    "lon":            False,
+                    "cep_short":      False,
                 },
                 zoom=map_zoom,
                 center=map_center,
@@ -844,117 +919,199 @@ with tab_geo:
                 category_orders={"tier": ["High", "Medium", "Low"]},
             )
 
-            # Add subway station layer
-            vis_st_plot = vis_st.dropna(subset=["lat", "lon"])
-            if not vis_st_plot.empty:
+            # Station layer — group by primary line color so legend is clean
+            added_line_legend = set()
+            for line_id, grp in vis_stations.groupby("primary_line"):
+                color  = MTA_LINE_COLORS.get(line_id, "#64748b")
+                in_leg = line_id not in added_line_legend
+                added_line_legend.add(line_id)
                 fig_geo.add_trace(go.Scattermapbox(
-                    lat=vis_st_plot["lat"],
-                    lon=vis_st_plot["lon"],
+                    lat=grp["lat"], lon=grp["lon"],
                     mode="markers",
-                    marker=dict(size=7, color="#64748b"),
-                    text=vis_st_plot["station_name"] + " (" + vis_st_plot["line"] + ")",
+                    marker=dict(size=9, color=color, opacity=0.85),
+                    text=grp["hover_text"],
                     hoverinfo="text",
-                    name="Subway Stations",
-                    showlegend=True,
+                    name=f"Line {line_id}",
+                    showlegend=in_leg,
                 ))
 
             # Highlight selected station
-            if sel_station != "(none — show all schools)" and not st_row.empty:
+            if not sel_st_row.empty:
                 fig_geo.add_trace(go.Scattermapbox(
-                    lat=st_row["lat"], lon=st_row["lon"],
-                    mode="markers",
-                    marker=dict(size=18, color="#f59e0b"),
+                    lat=sel_st_row["lat"], lon=sel_st_row["lon"],
+                    mode="markers+text",
+                    marker=dict(size=22, color="#f59e0b"),
                     text=[sel_station],
+                    textposition="top right",
+                    textfont=dict(size=11, color="#f59e0b"),
                     hoverinfo="text",
-                    name=f"⭐ {sel_station}",
-                    showlegend=True,
+                    name="Selected station",
+                    showlegend=False,
                 ))
+                # Draw radius circle approximation (ring of points)
+                if not geo_schools.empty:
+                    c_lat = float(sel_st_row.iloc[0]["lat"])
+                    c_lon = float(sel_st_row.iloc[0]["lon"])
+                    R = 6371.0
+                    angles = np.linspace(0, 2 * np.pi, 72)
+                    dlat = np.degrees(geo_radius_km / R)
+                    dlon = np.degrees(geo_radius_km / (R * np.cos(np.radians(c_lat))))
+                    ring_lats = (c_lat + dlat * np.sin(angles)).tolist() + [c_lat + dlat * np.sin(angles[0])]
+                    ring_lons = (c_lon + dlon * np.cos(angles)).tolist() + [c_lon + dlon * np.cos(angles[0])]
+                    fig_geo.add_trace(go.Scattermapbox(
+                        lat=ring_lats, lon=ring_lons,
+                        mode="lines",
+                        line=dict(color="#f59e0b", width=2),
+                        hoverinfo="skip",
+                        name="Radius",
+                        showlegend=False,
+                    ))
 
             fig_geo.update_layout(
-                height=560, margin={"r": 0, "t": 0, "l": 0, "b": 0},
-                legend_title_text="",
+                height=620,
+                margin={"r": 0, "t": 0, "l": 0, "b": 0},
+                legend=dict(
+                    title="",
+                    bgcolor="rgba(15,23,42,0.8)",
+                    font=dict(color="white", size=11),
+                    x=0.01, y=0.99,
+                    xanchor="left", yanchor="top",
+                ),
             )
             st.plotly_chart(fig_geo, use_container_width=True)
 
-        # ── Nearby schools panel ─────────────────────────────────────────
-        if sel_station != "(none — show all schools)" and not geo_schools.empty:
-            st_row = vis_st[vis_st["station_name"] == sel_station]
-            if not st_row.empty:
-                st_lat = float(st_row.iloc[0]["lat"])
-                st_lon = float(st_row.iloc[0]["lon"])
-                st_line = str(st_row.iloc[0]["line"])
+        # MTA color legend
+        line_groups = {
+            "🔴 1·2·3": "#EE352E",
+            "🟢 4·5·6": "#00933C",
+            "🟣 7":     "#B933AD",
+            "🔵 A·C·E": "#0039A6",
+            "🟠 B·D·F·M": "#FF6319",
+            "🟡 N·Q·R·W": "#FCCC0A",
+            "🩶 L":     "#A7A9AC",
+            "🟤 J·Z":   "#996633",
+            "🍏 G":     "#6CBE45",
+        }
+        leg_cols = st.columns(len(line_groups))
+        for col, (label, color) in zip(leg_cols, line_groups.items()):
+            col.markdown(
+                f"<span style='color:{color};font-size:.8rem;font-weight:700'>{label}</span>",
+                unsafe_allow_html=True,
+            )
 
-                dists   = _haversine_km(st_lat, st_lon,
-                                        geo_schools["lat"].values,
-                                        geo_schools["lon"].values)
-                nearby  = geo_schools[dists <= 1.5].copy()
-                nearby["walk_min"] = (dists[dists <= 1.5] / 5.0 * 60).round(1)
-                nearby  = nearby.sort_values("priority_score", ascending=False)
+    # ── Right panel: nearby schools ───────────────────────────────────────────
+    with panel_col:
+        if sel_st_row.empty:
+            st.markdown("#### Select a station")
+            st.caption("Use the dropdown above to choose a subway station. "
+                       "A panel with nearby schools and their aggregate profile will appear here.")
 
+            # Show a summary of line coverage
+            if not vis_stations.empty and not geo_schools.empty:
                 st.divider()
+                line_label = sel_line if sel_line != "All lines" else "all lines"
+                st.caption(f"**{len(vis_stations):,}** stations shown for {line_label}")
+                st.caption(f"**{len(geo_schools):,}** schools in current filter")
+        else:
+            st_lat = float(sel_st_row.iloc[0]["lat"])
+            st_lon = float(sel_st_row.iloc[0]["lon"])
+            st_line_raw = str(sel_st_row.iloc[0]["line"])
+
+            if geo_schools.empty:
+                st.info("No geo-coded schools in current filter.")
+            else:
+                dists  = _haversine_km(st_lat, st_lon,
+                                       geo_schools["lat"].values,
+                                       geo_schools["lon"].values)
+                mask   = dists <= geo_radius_km
+                nearby = geo_schools[mask].copy()
+                nearby["walk_min"] = (dists[mask] / 5.0 * 60).round(1)
+                nearby = nearby.sort_values("priority_score", ascending=False).reset_index(drop=True)
+
+                # 3-stop approximation: also include schools near 3 nearest same-line stations
+                same_line_st = vis_stations[
+                    vis_stations["line"].apply(lambda l: sel_line in _split_lines(l))
+                ] if sel_line != "All lines" else vis_stations
+
+                if len(same_line_st) >= 2 and not geo_schools.empty:
+                    st_dists_to_others = _haversine_km(
+                        st_lat, st_lon,
+                        same_line_st["lat"].values, same_line_st["lon"].values
+                    )
+                    neighbor_idx = np.argsort(st_dists_to_others)[1:4]  # 3 nearest (skip self)
+                    for idx in neighbor_idx:
+                        n_lat = float(same_line_st.iloc[idx]["lat"])
+                        n_lon = float(same_line_st.iloc[idx]["lon"])
+                        n_dists = _haversine_km(n_lat, n_lon,
+                                                geo_schools["lat"].values,
+                                                geo_schools["lon"].values)
+                        extra_mask = (n_dists <= geo_radius_km) & ~mask
+                        if extra_mask.any():
+                            extra = geo_schools[extra_mask].copy()
+                            extra["walk_min"] = (n_dists[extra_mask] / 5.0 * 60).round(1)
+                            nearby = pd.concat([nearby, extra], ignore_index=True)
+                            mask = mask | extra_mask
+
+                nearby = nearby.drop_duplicates("dbn").sort_values(
+                    "priority_score", ascending=False).reset_index(drop=True)
+
                 st.markdown(
-                    f"#### ⭐ {sel_station}  "
-                    f"<span style='color:#94a3b8;font-size:.9em'>"
-                    f"Lines {st_line} · {len(nearby)} schools within 1.5 km</span>",
+                    f"**{sel_station}**  "
+                    f"<span style='color:#94a3b8;font-size:.85em'>Lines: {st_line_raw}</span>",
                     unsafe_allow_html=True,
                 )
+                st.caption(f"{len(nearby)} schools within ~3-stop radius")
 
-                if nearby.empty:
-                    st.info("No schools found within 1.5 km of this station.")
-                else:
-                    pan_l, pan_r = st.columns([3, 2])
+                # Radar chart — aggregate of nearby schools
+                if len(nearby) > 0:
+                    avg = nearby.mean(numeric_only=True).to_dict()
+                    avg["school_name"]       = f"Avg ({len(nearby)} schools)"
+                    avg["has_literacy_goal"] = int(nearby["has_literacy_goal"].astype(float).mean() >= 0.5)
+                    avg["has_attendance_goal"] = int(nearby["has_attendance_goal"].astype(float).mean() >= 0.5)
+                    avg["has_ell_goal"]      = int(nearby["has_ell_goal"].astype(float).mean() >= 0.5)
+                    trace_avg, _ = _make_radar(avg, df_all,
+                                               name=f"Avg ({len(nearby)} schools)",
+                                               color="#6366f1")
+                    fig_nr = go.Figure(data=[trace_avg])
+                    fig_nr.update_layout(
+                        polar=dict(radialaxis=dict(visible=True, range=[0, 1],
+                                                   tickfont=dict(size=8))),
+                        showlegend=False, height=260,
+                        margin=dict(t=15, b=15, l=30, r=30),
+                    )
+                    st.plotly_chart(fig_nr, use_container_width=True)
 
-                    with pan_l:
-                        nearby_disp = nearby[[
-                            "school_name", "tier", "priority_score",
-                            "ell_pct", "grade_band", "walk_min",
-                        ]].copy()
-                        st.dataframe(
-                            nearby_disp,
-                            column_config={
-                                "school_name":    st.column_config.TextColumn("School", width="large"),
-                                "tier":           st.column_config.TextColumn("Tier", width="small"),
-                                "priority_score": st.column_config.NumberColumn("Score", format="%.1f"),
-                                "ell_pct":        st.column_config.NumberColumn("ELL %", format="%.1f%%"),
-                                "grade_band":     st.column_config.TextColumn("Grades"),
-                                "walk_min":       st.column_config.NumberColumn("Walk", format="%.1f min"),
-                            },
-                            hide_index=True, use_container_width=True, height=360,
-                        )
-                        st.download_button(
-                            "⬇ Export nearby schools CSV",
-                            data=nearby.to_csv(index=False),
-                            file_name=f"gale_near_{sel_station.replace(' ', '_')}.csv",
-                            mime="text/csv",
-                        )
+                    st.caption(
+                        f"Avg score **{nearby['priority_score'].mean():.1f}**  ·  "
+                        f"High: **{(nearby['tier']=='High').sum()}**  ·  "
+                        f"Avg ELL: **{nearby['ell_pct'].mean():.1f}%**"
+                    )
 
-                    with pan_r:
-                        st.markdown("**Aggregate profile — avg of nearby schools**")
-                        # Build average school dict for radar
-                        avg = nearby.mean(numeric_only=True).to_dict()
-                        avg["school_name"] = f"Avg ({len(nearby)} schools)"
-                        avg["has_literacy_goal"]  = int(
-                            nearby["has_literacy_goal"].astype(float).mean() >= 0.5)
-                        avg["has_attendance_goal"] = int(
-                            nearby["has_attendance_goal"].astype(float).mean() >= 0.5)
-                        avg["has_ell_goal"] = int(
-                            nearby["has_ell_goal"].astype(float).mean() >= 0.5)
+                st.divider()
 
-                        trace_avg, _ = _make_radar(avg, df_all,
-                                                   name=f"Avg ({len(nearby)} schools)",
-                                                   color="#6366f1")
-                        fig_nearby = go.Figure(data=[trace_avg])
-                        fig_nearby.update_layout(
-                            polar=dict(radialaxis=dict(visible=True, range=[0, 1],
-                                                       tickfont=dict(size=9))),
-                            showlegend=False, height=320,
-                            margin=dict(t=20, b=20, l=40, r=40),
-                        )
-                        st.plotly_chart(fig_nearby, use_container_width=True)
+                # School list with Score, Focus Goals, CEP link
+                for _, row in nearby.iterrows():
+                    cep_sht  = _dbn_to_short(str(row["dbn"]))
+                    cep_src  = str(row.get("summary_source") or "")
+                    cep_href = (f"https://www.nycenet.edu/documents/oaosi/cep/2025-26/cep_{cep_sht}.pdf"
+                                if cep_src not in ("unavailable", "data", "error")
+                                else None)
+                    tier_c   = {"High": "🟢", "Medium": "🟡", "Low": "🔴"}.get(str(row["tier"]), "⚪")
+                    cep_txt  = f"[CEP]({cep_href})" if cep_href else "CEP unavailable"
+                    focus    = str(row.get("focus") or "") or extract_focus_goals(
+                        str(row.get("needs_summary") or ""), school=row.to_dict())
+                    walk     = row.get("walk_min")
+                    walk_txt = f" · {walk:.0f} min walk" if pd.notna(walk) else ""
+                    st.markdown(
+                        f"{tier_c} **{str(row['school_name'])[:42]}**  \n"
+                        f"Score {row['priority_score']:.0f}{walk_txt}  ·  {focus}  ·  {cep_txt}",
+                        unsafe_allow_html=False,
+                    )
 
-                        # Summary stats
-                        st.caption(
-                            f"Avg score: **{nearby['priority_score'].mean():.1f}**  ·  "
-                            f"High priority: **{(nearby['tier']=='High').sum()}** schools  ·  "
-                            f"Avg ELL: **{nearby['ell_pct'].mean():.1f}%**"
-                        )
+                st.download_button(
+                    "⬇ Export nearby schools CSV",
+                    data=nearby.to_csv(index=False),
+                    file_name=f"gale_near_{sel_station.replace(' ', '_')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )

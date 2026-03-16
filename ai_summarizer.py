@@ -2,7 +2,9 @@
 ai_summarizer.py — AI-powered school needs summaries using Claude.
 
 For each school, fetches the NYC CEP (Comprehensive Education Plan) PDF at:
-  https://www.nycenet.edu/documents/oaosi/cep/2024-25/CEP_{DBN}.pdf
+  https://www.nycenet.edu/documents/oaosi/cep/2025-26/cep_{SHORT_DBN}.pdf
+  (short DBN = strip district prefix: 01M015 → M015)
+  Falls back to 2024-25 if the 2025-26 PDF returns 404.
 
 Claude reads the PDF and extracts:
   - ELA / literacy goals and current gap
@@ -32,7 +34,20 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schools.db")
 
-CEP_PDF_URL = "https://www.nycenet.edu/documents/oaosi/cep/2024-25/CEP_{dbn}.pdf"
+# Try 2025-26 first, fall back to 2024-25. Use lowercase filename, short DBN (M015 not 01M015).
+CEP_PDF_URLS = [
+    "https://www.nycenet.edu/documents/oaosi/cep/2025-26/cep_{short_dbn}.pdf",
+    "https://www.nycenet.edu/documents/oaosi/cep/2024-25/cep_{short_dbn}.pdf",
+]
+
+
+def _dbn_to_short(dbn: str) -> str:
+    """Strip district prefix: '01M015' → 'M015'."""
+    s = str(dbn).strip().upper()
+    for i, c in enumerate(s):
+        if c.isalpha():
+            return s[i:]
+    return s
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; gale-sales-tool/1.0)"}
 
@@ -141,36 +156,43 @@ def clear_all_summaries():
 def _fetch_cep_pdf(dbn: str) -> tuple:
     """
     Try to download the school's CEP PDF.
-    Returns (pdf_bytes, "cep_pdf") on success, or ("", "unavailable") on failure.
+    Tries 2025-26 first, then 2024-25. Uses short DBN (M015 not 01M015).
+    Returns (pdf_bytes, "cep_pdf") on success, or (b"", "unavailable") on failure.
     """
-    url = CEP_PDF_URL.format(dbn=dbn.upper())
-    try:
-        r = requests.get(url, timeout=30, headers=HEADERS, stream=True)
-        if r.status_code != 200:
-            logger.debug(f"CEP PDF {dbn}: HTTP {r.status_code}")
-            return b"", "unavailable"
+    short = _dbn_to_short(dbn)
+    for url_tmpl in CEP_PDF_URLS:
+        url = url_tmpl.format(short_dbn=short)
+        try:
+            r = requests.get(url, timeout=30, headers=HEADERS, stream=True)
+            if r.status_code == 404:
+                logger.debug(f"CEP PDF {dbn}: 404 at {url}")
+                continue
+            if r.status_code != 200:
+                logger.debug(f"CEP PDF {dbn}: HTTP {r.status_code} at {url}")
+                continue
 
-        content_type = r.headers.get("content-type", "").lower()
-        if "pdf" not in content_type and "octet-stream" not in content_type:
-            logger.debug(f"CEP PDF {dbn}: unexpected content-type {content_type}")
-            return b"", "unavailable"
+            content_type = r.headers.get("content-type", "").lower()
+            if "pdf" not in content_type and "octet-stream" not in content_type:
+                logger.debug(f"CEP PDF {dbn}: unexpected content-type {content_type} at {url}")
+                continue
 
-        # Read up to MAX_PDF_BYTES
-        chunks = []
-        total = 0
-        for chunk in r.iter_content(chunk_size=65536):
-            chunks.append(chunk)
-            total += len(chunk)
-            if total >= MAX_PDF_BYTES:
-                logger.debug(f"CEP PDF {dbn}: truncated at {MAX_PDF_BYTES} bytes")
-                break
-        pdf_bytes = b"".join(chunks)
-        logger.debug(f"CEP PDF {dbn}: {len(pdf_bytes):,} bytes")
-        return pdf_bytes, "cep_pdf"
+            chunks = []
+            total = 0
+            for chunk in r.iter_content(chunk_size=65536):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= MAX_PDF_BYTES:
+                    logger.debug(f"CEP PDF {dbn}: truncated at {MAX_PDF_BYTES} bytes")
+                    break
+            pdf_bytes = b"".join(chunks)
+            logger.debug(f"CEP PDF {dbn}: {len(pdf_bytes):,} bytes from {url}")
+            return pdf_bytes, "cep_pdf"
 
-    except Exception as e:
-        logger.debug(f"CEP PDF fetch {dbn}: {e}")
-        return b"", "unavailable"
+        except Exception as e:
+            logger.debug(f"CEP PDF fetch {dbn} at {url}: {e}")
+            continue
+
+    return b"", "unavailable"
 
 
 # ─── Claude summarization ─────────────────────────────────────────────────────
