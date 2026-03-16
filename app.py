@@ -259,7 +259,7 @@ def _make_radar(school, df_ref, name=None, color="#6366f1"):
     label = name or str(school.get("school_name", ""))[:40]
     trace = go.Scatterpolar(
         r=r, theta=cats_closed,
-        fill="toself", fillcolor=color + "33",
+        fill="toself",
         line=dict(color=color, width=2),
         name=label,
     )
