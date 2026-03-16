@@ -165,14 +165,14 @@ def _pad_dbn(dbn: str) -> str:
 
 
 _FOCUS_THEMES = {
-    "literacy":    ["literacy", "reading", "ela", "fluency", "comprehension"],
-    "ELL support": ["ell", "multilingual", "english language", "newcomer", "bilingual"],
-    "attendance":  ["attendance", "absenteeism", "chronic absence"],
-    "math":        ["math", "numeracy", "algebra", "stem"],
-    "rigor":       ["rigor", "college", "career", "grade-level", "academic achievement"],
-    "SEL":         ["social-emotional", "sel", "mental health", "wellness", "climate"],
-    "library":     ["library", "research", "database", "digital", "resources"],
-    "family":      ["family", "community", "parent"],
+    "Literacy":      ["literacy", "reading", "ela", "fluency", "comprehension"],
+    "ELL Support":   ["ell", "multilingual", "english language", "newcomer", "bilingual"],
+    "Attendance":    ["attendance", "absenteeism", "chronic absence"],
+    "Math":          ["math", "numeracy", "algebra", "stem"],
+    "Rigor":         ["rigor", "college", "career", "grade-level", "academic achievement"],
+    "SEL":           ["social-emotional", "sel", "mental health", "wellness", "climate"],
+    "Library":       ["library", "research", "database", "digital", "resources"],
+    "Family":        ["family", "community", "parent"],
 }
 
 
@@ -197,16 +197,16 @@ def extract_focus_goals(text: str = "", school: dict = None, n: int = 3) -> str:
         t3   = float(school.get("title3_amount") or 0)
         enr  = float(school.get("total_enrollment") or 0)
         signals = []
-        if pd.notna(ela) and float(ela) < 35 and "literacy" not in found:
-            signals.append("literacy")
-        if ell >= 30 and "ELL support" not in found:
-            signals.append("ELL support")
-        if att and "attendance" not in found:
-            signals.append("attendance")
-        if t3 > 0 and ell >= 20 and "ELL support" not in found + signals:
-            signals.append("ELL support")
-        if enr >= 1000 and len(found) + len(signals) < n and "high-enrollment" not in found:
-            signals.append("high-enrollment")
+        if pd.notna(ela) and float(ela) < 35 and "Literacy" not in found:
+            signals.append("Literacy")
+        if ell >= 30 and "ELL Support" not in found:
+            signals.append("ELL Support")
+        if att and "Attendance" not in found:
+            signals.append("Attendance")
+        if t3 > 0 and ell >= 20 and "ELL Support" not in found + signals:
+            signals.append("ELL Support")
+        if enr >= 1000 and len(found) + len(signals) < n and "High Enrollment" not in found:
+            signals.append("High Enrollment")
         for sig in signals:
             if len(found) >= n:
                 break
@@ -353,6 +353,49 @@ with tab_list:
         for text, (_, row) in zip(_summaries.tolist(), table_df.iterrows())
     ]
 
+    # ── Title I / Title III display columns (show estimates for $0 schools) ──────
+    # Compute borough-level Title I rate: $ per poverty-eligible student
+    _t1_mask = table_df["title1_amount"] > 0
+    _t1_schools = table_df[_t1_mask].copy()
+    _t1_schools["_pov_head"] = (
+        _t1_schools["total_enrollment"] * _t1_schools["poverty_pct"].fillna(0) / 100
+    )
+    _borough_t1_rate = {}
+    for _bor, _grp in _t1_schools.groupby("borough"):
+        _tot_t1 = _grp["title1_amount"].sum()
+        _tot_pov = _grp["_pov_head"].sum()
+        if _tot_pov > 0:
+            _borough_t1_rate[_bor] = _tot_t1 / _tot_pov
+
+    def _t1_display(row):
+        val = float(row.get("title1_amount", 0) or 0)
+        if val > 0:
+            return f"${val:,.0f}"
+        pov = float(row.get("poverty_pct", 0) or 0)
+        enr = float(row.get("total_enrollment", 0) or 0)
+        ell = float(row.get("ell_count", 0) or 0)
+        if pov == 0 and ell == 0:
+            return "—"
+        rate = _borough_t1_rate.get(str(row.get("borough", "")), 0)
+        if rate > 0:
+            headcount = (pov / 100) * enr if pov > 0 else ell * 0.5
+            est = rate * headcount
+            if est >= 5000:
+                return f"${est:,.0f} (est)"
+        return "—"
+
+    def _t3_display(row):
+        val = float(row.get("title3_amount", 0) or 0)
+        if val > 0:
+            return f"${val:,.0f}"
+        ell = float(row.get("ell_count", 0) or 0)
+        if ell > 0:
+            return f"${250 * ell:,.0f} (est)"
+        return "—"
+
+    table_df["title1_display"] = [_t1_display(r) for _, r in table_df.iterrows()]
+    table_df["title3_display"] = [_t3_display(r) for _, r in table_df.iterrows()]
+
     # Boolean goal columns
     for gc in ["has_literacy_goal", "has_ell_goal"]:
         if gc in table_df.columns:
@@ -370,16 +413,16 @@ with tab_list:
     )
 
     col_cfg = {
-        "school_name":       st.column_config.TextColumn("School Name", width="large"),
+        "school_name":       st.column_config.TextColumn("School Name", width=420),
         "borough":           st.column_config.TextColumn("Borough", width="small"),
-        "grade_band":        st.column_config.TextColumn("Grade Band"),
+        "grade_band":        st.column_config.TextColumn("Grade Band", width="small"),
         "priority_score":    st.column_config.NumberColumn("Score ℹ️",
                                  format="%.1f", help=score_help),
         "tier":              st.column_config.TextColumn("Tier", width="small"),
-        "title1_amount":     st.column_config.NumberColumn("Title I $", format="$%,.0f",
-                                 help="Estimated Title I Part A allocation (NYSED, distributed by poverty count)"),
-        "title3_amount":     st.column_config.NumberColumn("Title III $", format="$%,.0f",
-                                 help="Estimated Title III Part A allocation (NYSED, distributed by ELL count)"),
+        "title1_display":    st.column_config.TextColumn("Title I $",
+                                 help="Title I Part A allocation. '(est)' = estimated from borough average (school not yet matched in NYSED data)"),
+        "title3_display":    st.column_config.TextColumn("Title III $",
+                                 help="Title III Part A allocation. '(est)' = $250 × ELL count estimate"),
         "ell_pct":           st.column_config.NumberColumn("ELL %", format="%.1f%%"),
         "ell_count":         st.column_config.NumberColumn("ELL Count", format="%d"),
         "ela_proficiency":   st.column_config.NumberColumn("ELA Prof %", format="%.1f%%"),
@@ -395,16 +438,17 @@ with tab_list:
         "snapshot_url":      st.column_config.LinkColumn("Snapshot",
                                  display_text="📊 View", help="NYC Quality Snapshot (opens new tab)"),
         # hide raw/internal columns
-        "dbn": None, "_dbn_padded": None, "address": None, "lat": None, "lon": None,
+        "dbn": None, "_dbn_padded": None, "_dbn_short": None, "address": None, "lat": None, "lon": None,
         "poverty_pct": None, "has_attendance_goal": None, "has_library_mention": None,
         "needs_summary": None, "summary_source": None,
         "nearest_station": None, "nearest_line": None, "station_walk_min": None,
+        "title1_amount": None, "title3_amount": None,
     }
 
     # Column order per spec
     show_cols = [
         "school_name", "borough", "grade_band", "priority_score", "tier",
-        "title1_amount", "title3_amount",
+        "title1_display", "title3_display",
         "ell_pct", "ell_count", "ela_proficiency", "total_enrollment",
         "has_literacy_goal", "has_ell_goal", "focus_goals",
         "cep_pdf_url", "snapshot_url",
