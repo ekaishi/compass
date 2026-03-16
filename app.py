@@ -85,6 +85,14 @@ with st.sidebar:
     t1_map = {"All schools": None, "Has Title I funding": True, "No Title I": False}
     t1_choice = st.radio("Title I", list(t1_map.keys()), horizontal=False)
 
+    t3_map = {"All schools": None, "Has Title III funding": True, "No Title III": False}
+    t3_choice = st.radio("Title III", list(t3_map.keys()), horizontal=False)
+
+    ell_max_val = float(df_all["ell_pct"].max()) if not df_all.empty else 100.0
+    ell_range = st.slider("ELL % range", 0.0, ell_max_val,
+                          (0.0, ell_max_val), step=0.5,
+                          help="Filter by English Language Learner percentage")
+
     st.markdown("**iPlan Goals** (filter by AI-detected priorities)")
     lit_only  = st.checkbox("Has literacy goal")
     ell_only  = st.checkbox("Has ELL/multilingual goal")
@@ -125,6 +133,12 @@ if t1_map[t1_choice] is not None:
         df = df[df["title1_amount"] > 0]
     else:
         df = df[df["title1_amount"] == 0]
+if t3_map[t3_choice] is not None:
+    if t3_map[t3_choice]:
+        df = df[df["title3_amount"] > 0]
+    else:
+        df = df[df["title3_amount"] == 0]
+df = df[df["ell_pct"].between(ell_range[0], ell_range[1])]
 if lit_only:
     df = df[df.get("has_literacy_goal", pd.Series(0, index=df.index)).astype(bool)]
 if ell_only:
@@ -135,6 +149,45 @@ if att_only:
 df = df[df["total_enrollment"] >= enroll_range]
 df = df[df["priority_score"] >= score_min]
 df = df.sort_values("priority_score", ascending=False).reset_index(drop=True)
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _pad_dbn(dbn: str) -> str:
+    """Ensure DBN is 6-char zero-padded format, e.g. '1M15' → '01M015'."""
+    s = str(dbn).strip().upper()
+    if len(s) >= 6:
+        return s[:6]
+    for i, c in enumerate(s):
+        if c.isalpha():
+            return s[:i].zfill(2) + c + s[i + 1:].zfill(3)
+    return s
+
+
+_FOCUS_THEMES = {
+    "literacy":    ["literacy", "reading", "ela", "fluency", "comprehension"],
+    "ELL support": ["ell", "multilingual", "english language", "newcomer", "bilingual"],
+    "attendance":  ["attendance", "absenteeism", "chronic absence"],
+    "math":        ["math", "numeracy", "algebra", "stem"],
+    "rigor":       ["rigor", "college", "career", "grade-level", "academic achievement"],
+    "SEL":         ["social-emotional", "sel", "mental health", "wellness", "climate"],
+    "library":     ["library", "research", "database", "digital", "resources"],
+    "family":      ["family", "community", "parent"],
+}
+
+
+def extract_focus_goals(text: str, n: int = 3) -> str:
+    """Return top N focus keywords from CEP summary text as 'a · b · c'."""
+    if not text:
+        return ""
+    tl = text.lower()
+    found = []
+    for theme, keywords in _FOCUS_THEMES.items():
+        if any(kw in tl for kw in keywords):
+            found.append(theme)
+        if len(found) >= n:
+            break
+    return " · ".join(found[:n])
+
 
 # ─── Helper: radar chart ──────────────────────────────────────────────────────
 
@@ -235,8 +288,8 @@ st.divider()
 
 # ─── Tabs ────────────────────────────────────────────────────────────────────
 
-tab_list, tab_map, tab_chart, tab_day = st.tabs(
-    ["📋 Ranked List", "🗺 Map", "📊 Charts", "🚇 Plan My Day"]
+tab_list, tab_map, tab_chart, tab_geo = st.tabs(
+    ["📋 Ranked List", "🗺 Map", "📊 Charts", "🗺 Geography"]
 )
 
 # ════════════════════════════════════════════════════════
@@ -247,16 +300,30 @@ with tab_list:
 
     table_df = df.reset_index(drop=True).copy()
 
-    # Add computed display columns
-    table_df["cep_pdf_url"]  = ("https://www.nycenet.edu/documents/oaosi/cep/2024-25/CEP_"
-                                + table_df["dbn"].astype(str).str.upper() + ".pdf")
+    # Zero-pad DBN for URL construction
+    table_df["_dbn_padded"] = table_df["dbn"].apply(_pad_dbn)
+
+    # CEP link: only show if PDF was confirmed available (or not yet checked)
+    # "unavailable"/"data"/"error" = PDF was inaccessible; don't show a broken link
+    def _cep_url(row):
+        src = str(row.get("summary_source", ""))
+        if src in ("unavailable", "data", "error"):
+            return None
+        return ("https://www.nycenet.edu/documents/oaosi/cep/2024-25/CEP_"
+                + row["_dbn_padded"] + ".pdf")
+
+    table_df["cep_pdf_url"]  = table_df.apply(_cep_url, axis=1)
     table_df["snapshot_url"] = ("https://tools.nycps.org/reports/quality-snapshot/"
-                                + table_df["dbn"].astype(str))
-    table_df["title3"]       = table_df.get("title3_amount",
-                                             pd.Series(0, index=table_df.index)) > 0
+                                + table_df["_dbn_padded"])
+
+    # Focus goals from CEP summary
+    table_df["focus_goals"] = table_df.get("needs_summary",
+                                            pd.Series("", index=table_df.index)).apply(
+        lambda t: extract_focus_goals(str(t or ""))
+    )
 
     # Boolean goal columns
-    for gc in ["has_literacy_goal", "has_ell_goal", "has_attendance_goal", "has_library_mention"]:
+    for gc in ["has_literacy_goal", "has_ell_goal"]:
         if gc in table_df.columns:
             table_df[gc] = table_df[gc].astype(bool)
 
@@ -278,36 +345,40 @@ with tab_list:
         "priority_score":    st.column_config.NumberColumn("Score ℹ️",
                                  format="%.1f", help=score_help),
         "tier":              st.column_config.TextColumn("Tier", width="small"),
+        "title1_amount":     st.column_config.NumberColumn("Title I $", format="$%,.0f",
+                                 help="Estimated Title I Part A allocation (NYSED, distributed by poverty count)"),
+        "title3_amount":     st.column_config.NumberColumn("Title III $", format="$%,.0f",
+                                 help="Estimated Title III Part A allocation (NYSED, distributed by ELL count)"),
         "ell_pct":           st.column_config.NumberColumn("ELL %", format="%.1f%%"),
         "ell_count":         st.column_config.NumberColumn("ELL Count", format="%d"),
         "ela_proficiency":   st.column_config.NumberColumn("ELA Prof %", format="%.1f%%"),
         "total_enrollment":  st.column_config.NumberColumn("Enrollment", format="%d"),
-        "title1_amount":     st.column_config.NumberColumn("Title I $", format="$%,.0f"),
-        "title3":            st.column_config.CheckboxColumn("Title III"),
-        "poverty_pct":       st.column_config.NumberColumn("Poverty %", format="%.1f%%"),
         "has_literacy_goal": st.column_config.CheckboxColumn("Literacy Goal",
                                  help="CEP identifies literacy/ELA as a school priority"),
         "has_ell_goal":      st.column_config.CheckboxColumn("ELL Goal",
                                  help="CEP identifies ELL/multilingual as a school priority"),
+        "focus_goals":       st.column_config.TextColumn("Focus Goals",
+                                 help="Top themes extracted from school's CEP summary"),
         "cep_pdf_url":       st.column_config.LinkColumn("CEP",
-                                 display_text="📄 PDF", help="Comprehensive Education Plan PDF"),
+                                 display_text="📄 PDF", help="Comprehensive Education Plan PDF (opens new tab)"),
         "snapshot_url":      st.column_config.LinkColumn("Snapshot",
-                                 display_text="📊 View", help="NYC Quality Snapshot report"),
-        # hide raw columns
-        "dbn": None, "address": None, "lat": None, "lon": None,
-        "title3_amount": None, "has_attendance_goal": None, "has_library_mention": None,
+                                 display_text="📊 View", help="NYC Quality Snapshot (opens new tab)"),
+        # hide raw/internal columns
+        "dbn": None, "_dbn_padded": None, "address": None, "lat": None, "lon": None,
+        "poverty_pct": None, "has_attendance_goal": None, "has_library_mention": None,
         "needs_summary": None, "summary_source": None,
         "nearest_station": None, "nearest_line": None, "station_walk_min": None,
     }
 
-    show_cols = ["school_name", "borough", "grade_band", "priority_score", "tier",
-                 "ell_pct", "ell_count", "ela_proficiency",
-                 "total_enrollment", "title3", "has_literacy_goal", "has_ell_goal",
-                 "cep_pdf_url", "snapshot_url"]
-    if has_title1:
-        show_cols.insert(6, "title1_amount")
-
-    # Filter to columns that exist
+    # Column order per spec
+    show_cols = [
+        "school_name", "borough", "grade_band", "priority_score", "tier",
+        "title1_amount", "title3_amount",
+        "ell_pct", "ell_count", "ela_proficiency", "total_enrollment",
+        "has_literacy_goal", "has_ell_goal", "focus_goals",
+        "cep_pdf_url", "snapshot_url",
+    ]
+    # Filter to columns that exist in this dataframe
     show_cols = [c for c in show_cols if c in table_df.columns]
 
     selection = st.dataframe(
@@ -384,7 +455,8 @@ with tab_list:
         idx    = selected_rows[0]
         school = df.iloc[idx]
         tier   = str(school.get("tier", "Low"))
-        dbn    = str(school["dbn"])
+        dbn     = str(school["dbn"])
+        dbn_pad = _pad_dbn(dbn)
 
         tier_badge = {
             "High":   '<span class="badge-high">High Priority</span>',
@@ -395,10 +467,14 @@ with tab_list:
         st.divider()
         st.markdown(f"### {school['school_name']}  {tier_badge}", unsafe_allow_html=True)
 
-        cep_url      = f"https://www.nycenet.edu/documents/oaosi/cep/2024-25/CEP_{dbn.upper()}.pdf"
-        snapshot_url = f"https://tools.nycps.org/reports/quality-snapshot/{dbn}"
+        cep_src      = str(school.get("summary_source", ""))
+        cep_url      = f"https://www.nycenet.edu/documents/oaosi/cep/2024-25/CEP_{dbn_pad}.pdf"
+        snapshot_url = f"https://tools.nycps.org/reports/quality-snapshot/{dbn_pad}"
+        cep_link     = (f"[📄 CEP PDF]({cep_url}){{target=_blank}}"
+                        if cep_src != "unavailable"
+                        else "📄 CEP unavailable")
         st.caption(
-            f"DBN {dbn}  ·  {school.get('address', '—')}  ·  "
+            f"DBN {dbn_pad}  ·  {school.get('address', '—')}  ·  "
             f"{school['borough']}  ·  {school['grade_band']}  ·  "
             f"[📄 CEP PDF]({cep_url})  ·  [📊 Quality Snapshot]({snapshot_url})"
         )
@@ -671,18 +747,19 @@ with tab_chart:
 
 
 # ════════════════════════════════════════════════════════
-#  TAB 4 — PLAN MY DAY (Subway territory view)
+#  TAB 4 — GEOGRAPHY (Interactive station + school map)
 # ════════════════════════════════════════════════════════
-with tab_day:
-    st.markdown("### 🚇 Plan My Day — Territory by Subway Line")
-    st.caption("Filter schools by subway line to plan an efficient visit route.")
+with tab_geo:
+    st.markdown("### 🗺 Geography — Schools & Subway Territory")
+    st.caption("All filtered schools plotted on the map. Select a subway station to see "
+               "nearby schools and their aggregate profile.")
 
     stations_df = load_subway_stations()
 
     if stations_df.empty:
         st.info("Subway station data not yet loaded. "
-                "Click **Refresh Data** in the sidebar or load just the station data below.")
-        if st.button("🚇 Load Subway Station Data", type="primary"):
+                "Click **Refresh Data** in the sidebar, or load stations only:")
+        if st.button("🚇 Load Subway Station Data", type="primary", key="load_geo_stations"):
             with st.spinner("Fetching MTA subway station data…"):
                 new_stations = fetch_subway_stations()
                 if not new_stations.empty:
@@ -692,139 +769,192 @@ with tab_day:
                 else:
                     st.error("Could not fetch station data — check internet connection.")
     else:
-        # Build sorted list of all individual lines from the "line" column (e.g. "A-C-E" → A, C, E)
-        all_lines = set()
-        for raw_line in stations_df["line"].dropna():
-            for part in str(raw_line).replace(",", "-").split("-"):
-                clean = part.strip()
-                if clean:
-                    all_lines.add(clean)
-        all_lines = sorted(all_lines)
+        # ── Controls ────────────────────────────────────────────────────────
+        def _split_lines(raw):
+            return [p.strip() for p in str(raw).replace(",", " ").split() if p.strip()]
 
-        c1, c2, c3 = st.columns([2, 2, 3])
-        with c1:
-            sel_lines = st.multiselect(
-                "Subway lines", all_lines,
-                default=all_lines[:3] if len(all_lines) >= 3 else all_lines,
-                help="Filter subway stations to selected lines"
+        all_lines = sorted({line for raw in stations_df["line"].dropna()
+                            for line in _split_lines(raw)})
+
+        ctrl1, ctrl2 = st.columns([2, 3])
+        with ctrl1:
+            line_filter = st.multiselect(
+                "Filter subway lines (empty = all)",
+                all_lines, default=[],
+                help="Show only stations serving these lines",
+                key="geo_lines",
             )
-        with c2:
-            max_walk = st.slider("Max walk time (min)", 1, 30, 10,
-                                  help="Only show schools within this walk of a station")
-        with c3:
-            day_borough = st.multiselect("Borough", boroughs, default=boroughs,
-                                          key="day_borough")
-
-        if not sel_lines:
-            st.info("Select at least one subway line.")
-        else:
-            # Filter stations to selected lines
-            def _line_matches(line_str, sel):
-                for part in str(line_str).replace(",", "-").split("-"):
-                    if part.strip() in sel:
-                        return True
-                return False
-
-            filtered_stations = stations_df[
-                stations_df["line"].apply(lambda l: _line_matches(l, set(sel_lines)))
-            ].copy()
-
-            if filtered_stations.empty:
-                st.warning("No stations found for the selected lines.")
-            else:
-                # Map schools to nearest of the filtered stations
-                day_schools = df[df["borough"].isin(day_borough)].copy()
-                day_schools["lat"] = pd.to_numeric(day_schools["lat"], errors="coerce")
-                day_schools["lon"] = pd.to_numeric(day_schools["lon"], errors="coerce")
-                day_schools = day_schools.dropna(subset=["lat", "lon"])
-                day_schools = day_schools[
-                    (day_schools["lat"].between(40.4, 41.0)) &
-                    (day_schools["lon"].between(-74.4, -73.6))
+        with ctrl2:
+            station_list = ["(none — show all schools)"]
+            if line_filter:
+                vis_st = stations_df[
+                    stations_df["line"].apply(
+                        lambda l: bool(set(_split_lines(l)) & set(line_filter))
+                    )
                 ]
+            else:
+                vis_st = stations_df
+            station_list += sorted(vis_st["station_name"].unique().tolist())
+            sel_station = st.selectbox(
+                "Focus station → nearby schools panel",
+                station_list, index=0,
+                key="geo_station",
+            )
 
-                if day_schools.empty:
-                    st.info("No geo-coded schools match current filters.")
+        # ── Map data ────────────────────────────────────────────────────────
+        geo_schools = df.copy()
+        geo_schools["lat"] = pd.to_numeric(geo_schools["lat"], errors="coerce")
+        geo_schools["lon"] = pd.to_numeric(geo_schools["lon"], errors="coerce")
+        geo_schools = geo_schools.dropna(subset=["lat", "lon"])
+        geo_schools = geo_schools[
+            geo_schools["lat"].between(40.4, 41.0) &
+            geo_schools["lon"].between(-74.4, -73.6)
+        ]
+
+        # Determine map center
+        if sel_station != "(none — show all schools)":
+            st_row = vis_st[vis_st["station_name"] == sel_station]
+            map_center = ({"lat": float(st_row.iloc[0]["lat"]),
+                           "lon": float(st_row.iloc[0]["lon"])}
+                          if not st_row.empty
+                          else {"lat": 40.710, "lon": -73.960})
+            map_zoom = 13
+        else:
+            map_center = {"lat": 40.710, "lon": -73.960}
+            map_zoom = 10
+
+        # Build map
+        if geo_schools.empty:
+            st.info("No geo-coded schools in current filter.")
+        else:
+            fig_geo = px.scatter_mapbox(
+                geo_schools,
+                lat="lat", lon="lon",
+                color="tier", color_discrete_map=TIER_COLORS,
+                size="priority_score", size_max=16,
+                hover_name="school_name",
+                hover_data={
+                    "priority_score": ":.1f", "borough": True,
+                    "grade_band": True, "ell_pct": ":.1f",
+                    "tier": False, "lat": False, "lon": False,
+                },
+                zoom=map_zoom,
+                center=map_center,
+                mapbox_style="open-street-map",
+                category_orders={"tier": ["High", "Medium", "Low"]},
+            )
+
+            # Add subway station layer
+            vis_st_plot = vis_st.dropna(subset=["lat", "lon"])
+            if not vis_st_plot.empty:
+                fig_geo.add_trace(go.Scattermapbox(
+                    lat=vis_st_plot["lat"],
+                    lon=vis_st_plot["lon"],
+                    mode="markers",
+                    marker=dict(size=7, color="#64748b"),
+                    text=vis_st_plot["station_name"] + " (" + vis_st_plot["line"] + ")",
+                    hoverinfo="text",
+                    name="Subway Stations",
+                    showlegend=True,
+                ))
+
+            # Highlight selected station
+            if sel_station != "(none — show all schools)" and not st_row.empty:
+                fig_geo.add_trace(go.Scattermapbox(
+                    lat=st_row["lat"], lon=st_row["lon"],
+                    mode="markers",
+                    marker=dict(size=18, color="#f59e0b"),
+                    text=[sel_station],
+                    hoverinfo="text",
+                    name=f"⭐ {sel_station}",
+                    showlegend=True,
+                ))
+
+            fig_geo.update_layout(
+                height=560, margin={"r": 0, "t": 0, "l": 0, "b": 0},
+                legend_title_text="",
+            )
+            st.plotly_chart(fig_geo, use_container_width=True)
+
+        # ── Nearby schools panel ─────────────────────────────────────────
+        if sel_station != "(none — show all schools)" and not geo_schools.empty:
+            st_row = vis_st[vis_st["station_name"] == sel_station]
+            if not st_row.empty:
+                st_lat = float(st_row.iloc[0]["lat"])
+                st_lon = float(st_row.iloc[0]["lon"])
+                st_line = str(st_row.iloc[0]["line"])
+
+                dists   = _haversine_km(st_lat, st_lon,
+                                        geo_schools["lat"].values,
+                                        geo_schools["lon"].values)
+                nearby  = geo_schools[dists <= 1.5].copy()
+                nearby["walk_min"] = (dists[dists <= 1.5] / 5.0 * 60).round(1)
+                nearby  = nearby.sort_values("priority_score", ascending=False)
+
+                st.divider()
+                st.markdown(
+                    f"#### ⭐ {sel_station}  "
+                    f"<span style='color:#94a3b8;font-size:.9em'>"
+                    f"Lines {st_line} · {len(nearby)} schools within 1.5 km</span>",
+                    unsafe_allow_html=True,
+                )
+
+                if nearby.empty:
+                    st.info("No schools found within 1.5 km of this station.")
                 else:
-                    # Re-map to filtered stations only
-                    mapped = map_schools_to_stations(day_schools, filtered_stations)
-                    mapped = mapped[mapped["station_walk_min"] <= max_walk].copy()
+                    pan_l, pan_r = st.columns([3, 2])
 
-                    # ── Map: stations + schools ─────────────────────────────
-                    st.markdown(f"**{len(mapped):,} schools** within {max_walk} min walk "
-                                f"of {len(filtered_stations):,} {'/'.join(sel_lines[:6])} stations")
+                    with pan_l:
+                        nearby_disp = nearby[[
+                            "school_name", "tier", "priority_score",
+                            "ell_pct", "grade_band", "walk_min",
+                        ]].copy()
+                        st.dataframe(
+                            nearby_disp,
+                            column_config={
+                                "school_name":    st.column_config.TextColumn("School", width="large"),
+                                "tier":           st.column_config.TextColumn("Tier", width="small"),
+                                "priority_score": st.column_config.NumberColumn("Score", format="%.1f"),
+                                "ell_pct":        st.column_config.NumberColumn("ELL %", format="%.1f%%"),
+                                "grade_band":     st.column_config.TextColumn("Grades"),
+                                "walk_min":       st.column_config.NumberColumn("Walk", format="%.1f min"),
+                            },
+                            hide_index=True, use_container_width=True, height=360,
+                        )
+                        st.download_button(
+                            "⬇ Export nearby schools CSV",
+                            data=nearby.to_csv(index=False),
+                            file_name=f"gale_near_{sel_station.replace(' ', '_')}.csv",
+                            mime="text/csv",
+                        )
 
-                    # Build combined map
-                    station_pts = filtered_stations.copy()
-                    station_pts["label"] = (station_pts["station_name"] + " ("
-                                            + station_pts["line"] + ")")
+                    with pan_r:
+                        st.markdown("**Aggregate profile — avg of nearby schools**")
+                        # Build average school dict for radar
+                        avg = nearby.mean(numeric_only=True).to_dict()
+                        avg["school_name"] = f"Avg ({len(nearby)} schools)"
+                        avg["has_literacy_goal"]  = int(
+                            nearby["has_literacy_goal"].astype(float).mean() >= 0.5)
+                        avg["has_attendance_goal"] = int(
+                            nearby["has_attendance_goal"].astype(float).mean() >= 0.5)
+                        avg["has_ell_goal"] = int(
+                            nearby["has_ell_goal"].astype(float).mean() >= 0.5)
 
-                    fig_day = px.scatter_mapbox(
-                        mapped, lat="lat", lon="lon",
-                        color="tier", color_discrete_map=TIER_COLORS,
-                        size="priority_score", size_max=16,
-                        hover_name="school_name",
-                        hover_data={"priority_score": ":.1f", "borough": True,
-                                     "station_walk_min": ":.1f",
-                                     "lat": False, "lon": False, "tier": False},
-                        zoom=11,
-                        center={"lat": 40.710, "lon": -73.960},
-                        mapbox_style="open-street-map",
-                        category_orders={"tier": ["High", "Medium", "Low"]},
-                    )
-                    # Add subway stations as grey markers
-                    fig_day.add_trace(go.Scattermapbox(
-                        lat=station_pts["lat"], lon=station_pts["lon"],
-                        mode="markers",
-                        marker=dict(size=10, color="#64748b", symbol="circle"),
-                        text=station_pts["label"],
-                        hoverinfo="text",
-                        name="Subway Station",
-                        showlegend=True,
-                    ))
-                    fig_day.update_layout(
-                        height=520,
-                        margin={"r": 0, "t": 0, "l": 0, "b": 0},
-                        legend_title_text="",
-                    )
-                    st.plotly_chart(fig_day, use_container_width=True)
+                        trace_avg, _ = _make_radar(avg, df_all,
+                                                   name=f"Avg ({len(nearby)} schools)",
+                                                   color="#6366f1")
+                        fig_nearby = go.Figure(data=[trace_avg])
+                        fig_nearby.update_layout(
+                            polar=dict(radialaxis=dict(visible=True, range=[0, 1],
+                                                       tickfont=dict(size=9))),
+                            showlegend=False, height=320,
+                            margin=dict(t=20, b=20, l=40, r=40),
+                        )
+                        st.plotly_chart(fig_nearby, use_container_width=True)
 
-                    # ── Day plan table ──────────────────────────────────────
-                    st.markdown("#### Day Plan — Schools Grouped by Nearest Station")
-
-                    plan_df = (mapped[["nearest_station", "nearest_line", "station_walk_min",
-                                        "school_name", "borough", "grade_band",
-                                        "priority_score", "tier", "ell_pct",
-                                        "title1_amount", "dbn"]]
-                               .sort_values(["nearest_station", "station_walk_min"]))
-
-                    plan_df = plan_df.rename(columns={
-                        "nearest_station":  "Station",
-                        "nearest_line":     "Line(s)",
-                        "station_walk_min": "Walk (min)",
-                        "school_name":      "School",
-                        "borough":          "Borough",
-                        "grade_band":       "Grade Band",
-                        "priority_score":   "Score",
-                        "tier":             "Tier",
-                        "ell_pct":          "ELL %",
-                        "title1_amount":    "Title I $",
-                    })
-
-                    plan_cfg = {
-                        "Walk (min)": st.column_config.NumberColumn(format="%.1f min"),
-                        "Score":      st.column_config.NumberColumn(format="%.1f"),
-                        "ELL %":      st.column_config.NumberColumn(format="%.1f%%"),
-                        "Title I $":  st.column_config.NumberColumn(format="$%,.0f"),
-                        "dbn":        None,
-                    }
-                    st.dataframe(plan_df.drop(columns=["dbn"]),
-                                  column_config=plan_cfg,
-                                  hide_index=True, use_container_width=True, height=400)
-
-                    # Export
-                    st.download_button(
-                        "⬇ Export Day Plan CSV",
-                        data=plan_df.to_csv(index=False),
-                        file_name="gale_day_plan.csv",
-                        mime="text/csv",
-                    )
+                        # Summary stats
+                        st.caption(
+                            f"Avg score: **{nearby['priority_score'].mean():.1f}**  ·  "
+                            f"High priority: **{(nearby['tier']=='High').sum()}** schools  ·  "
+                            f"Avg ELL: **{nearby['ell_pct'].mean():.1f}%**"
+                        )
