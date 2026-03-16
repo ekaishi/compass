@@ -331,19 +331,33 @@ with tab_list:
     table_df["_dbn_padded"] = table_df["dbn"].apply(_pad_dbn)
     table_df["_dbn_short"]  = table_df["dbn"].apply(_dbn_to_short)  # M015 not 01M015
 
-    # CEP link: 2025-26 URL. Hide link only when PDF confirmed unavailable.
+    # CEP link: 2025-26 URL, short DBN (M552 not 06M552). Hide when unavailable.
     _src = (table_df.get("summary_source", pd.Series("", index=table_df.index))
             .fillna("").astype(str))
     _unavail = _src.isin(["unavailable", "data", "error"])
     _cep_base = ("https://www.nycenet.edu/documents/oaosi/cep/2025-26/cep_"
-                 + table_df["_dbn_short"] + ".pdf")
-    # Use list to avoid pandas DataFrame-multi-column assignment bug
+                 + table_df["_dbn_short"].str.lower() + ".pdf")
     table_df["cep_pdf_url"] = [
         None if u else url
         for u, url in zip(_unavail.tolist(), _cep_base.tolist())
     ]
-    table_df["snapshot_url"] = ("https://tools.nycps.org/reports/quality-snapshot/"
-                                + table_df["_dbn_padded"])
+
+    # Quality Snapshot URL: https://tools.nycenet.edu/snapshot/0/{DBN}/{school_type}/
+    _GRADE_TO_TYPE = {
+        "Elementary":   "ES",
+        "Middle School": "EMS",
+        "High School":  "HS",
+        "K-8":          "K8",
+        "K-12":         "K12",
+        "Middle-High":  "HS",   # best match
+        "Unknown":      "ES",
+    }
+    table_df["snapshot_url"] = [
+        "https://tools.nycenet.edu/snapshot/0/{}/{}/".format(
+            dbn, _GRADE_TO_TYPE.get(str(gb), "ES")
+        )
+        for dbn, gb in zip(table_df["_dbn_padded"], table_df["grade_band"])
+    ]
 
     # Focus goals: text-based from CEP summary + quantitative fallback
     _summaries = (table_df.get("needs_summary", pd.Series("", index=table_df.index))
